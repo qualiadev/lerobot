@@ -27,6 +27,9 @@ lerobot-calibrate \
 ```
 """
 
+# Patch: force DepthAICameraConfig registration with draccus ChoiceClass
+from lerobot.cameras.depthai.configuration_depthai import DepthAICameraConfig  # noqa: F401
+
 import logging
 from dataclasses import asdict, dataclass
 from pprint import pformat

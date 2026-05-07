@@ -53,6 +53,9 @@ lerobot-teleoperate \
 
 """
 
+# Patch: force DepthAICameraConfig registration with draccus ChoiceClass
+from lerobot.cameras.depthai.configuration_depthai import DepthAICameraConfig  # noqa: F401
+
 import logging
 import time
 from dataclasses import asdict, dataclass

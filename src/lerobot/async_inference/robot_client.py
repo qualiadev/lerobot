@@ -33,6 +33,9 @@ python src/lerobot/async_inference/robot_client.py \
 ```
 """
 
+# Patch: force DepthAICameraConfig registration with draccus ChoiceClass
+from lerobot.cameras.depthai.configuration_depthai import DepthAICameraConfig  # noqa: F401
+
 import logging
 import pickle  # nosec
 import threading
