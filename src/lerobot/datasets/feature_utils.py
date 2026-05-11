@@ -39,6 +39,23 @@ from .utils import (
     DatasetInfo,
 )
 
+# ---------------------------------------------------------------------------
+# Backward-compatibility re-exports (mQualia/dk1-patches-v3, 2026-05-11)
+#
+# Upstream commit df0763a2 ("feat(dependencies): minimal default tag install")
+# moved several helpers from `lerobot.datasets.feature_utils` to
+# `lerobot.utils.feature_utils`. Downstream code (e.g. q-trlc-dk1's inference
+# scripts) still imports them from the old location, so we re-export them
+# here. The implementations live in `lerobot.utils.feature_utils`; we never
+# duplicate logic.
+# ---------------------------------------------------------------------------
+from lerobot.utils.feature_utils import (  # noqa: E402, F401
+    build_dataset_frame,
+    combine_feature_dicts,
+    dataset_to_policy_features,
+    hw_to_dataset_features,
+)
+
 
 def get_hf_features_from_features(features: dict) -> datasets.Features:
     """Convert a LeRobot features dictionary to a `datasets.Features` object.
