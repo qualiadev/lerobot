@@ -149,6 +149,7 @@ Usage examples
 
 import logging
 
+from lerobot.cameras.depthai import DepthAICameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.cameras.zmq import ZMQCameraConfig  # noqa: F401
