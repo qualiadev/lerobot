@@ -298,8 +298,15 @@ def record_loop(
     no_action_count = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
-    # Track pause-state transitions so we only log once per edge instead of every tick.
+    # Track pause-state transitions so we only log once per edge instead of every tick,
+    # and accumulate paused wall-clock time so it does NOT count against control_time_s.
+    # The effective timestamp is `now - start - total_paused`, so the budget
+    # ('episode_time_s' / 'reset_time_s') only ticks while actively recording.
     last_paused_state = events.get("paused", False)
+    total_paused_s = 0.0
+    paused_segment_start: float | None = (
+        time.perf_counter() if last_paused_state else None
+    )
     if last_paused_state and dataset is not None:
         logging.info("Recording starts in PAUSED state — frames will not be appended until pedal/key resume.")
     while timestamp < control_time_s:
@@ -315,9 +322,21 @@ def record_loop(
         paused = events.get("paused", False)
         if paused != last_paused_state:
             if paused:
+                paused_segment_start = start_loop_t
                 logging.info("Recording PAUSED — robot still executing teleop, but frames are NOT being saved.")
             else:
-                logging.info("Recording RESUMED — appending frames to dataset.")
+                if paused_segment_start is not None:
+                    segment_s = start_loop_t - paused_segment_start
+                    total_paused_s += segment_s
+                    paused_segment_start = None
+                    logging.info(
+                        "Recording RESUMED — appending frames to dataset "
+                        "(paused %.2fs; total paused this episode %.2fs).",
+                        segment_s,
+                        total_paused_s,
+                    )
+                else:
+                    logging.info("Recording RESUMED — appending frames to dataset.")
             last_paused_state = paused
 
         # Get robot observation
@@ -388,7 +407,13 @@ def record_loop(
 
         precise_sleep(max(sleep_time_s, 0.0))
 
-        timestamp = time.perf_counter() - start_episode_t
+        # Subtract accumulated paused wall-clock time so the episode timer only
+        # advances while we are actually recording.  If currently paused, also
+        # subtract the in-progress paused segment so the loop doesn't tick out
+        # halfway through a long pause.
+        now = time.perf_counter()
+        live_pause_s = (now - paused_segment_start) if paused_segment_start is not None else 0.0
+        timestamp = now - start_episode_t - total_paused_s - live_pause_s
 
 
 @parser.wrap()
