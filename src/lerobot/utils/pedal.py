@@ -54,12 +54,20 @@ def start_pedal_listener(
     try:
         from evdev import InputDevice, categorize, ecodes
     except ImportError:
+        logger.warning(
+            "Pedal listener disabled: 'evdev' is not installed in this environment. "
+            "Install it (e.g. `pip install evdev`) to enable foot-pedal input."
+        )
         return None
 
     def pedal_reader() -> None:
         try:
             dev = InputDevice(device_path)
-            logger.info("Pedal connected: %s", dev.name)
+            logger.info(
+                "Pedal connected: name=%r device=%s (listening for key-down events)",
+                dev.name,
+                device_path,
+            )
             for ev in dev.read_loop():
                 if ev.type != ecodes.EV_KEY:
                     continue
@@ -69,12 +77,28 @@ def start_pedal_listener(
                     code = code[0]
                 if key.keystate != 1:  # only key-down events
                     continue
+                logger.debug("Pedal key-down: %s", code)
                 try:
                     on_press(code)
                 except Exception as cb_err:  # pragma: no cover - defensive
                     logger.warning("Pedal callback error: %s", cb_err)
-        except (FileNotFoundError, PermissionError):
-            pass
+        except FileNotFoundError:
+            logger.warning(
+                "Pedal device not found: %s. The foot-pedal listener will not "
+                "receive any input. Confirm the pedal is plugged in and check "
+                "`ls /dev/input/by-id/` for the actual device path; pass it via "
+                "--pedal.device_path=... if it differs from the default.",
+                device_path,
+            )
+        except PermissionError:
+            logger.warning(
+                "Pedal device permission denied: %s. Grant the current user "
+                "read access (e.g. `sudo setfacl -m u:$USER:rw %s`, or add the "
+                "user to the 'input' group and re-login). Foot-pedal input will "
+                "be ignored until permission is granted.",
+                device_path,
+                device_path,
+            )
         except Exception as e:
             logger.warning("Pedal error: %s", e)
 
