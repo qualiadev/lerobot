@@ -264,7 +264,13 @@ def record_loop(
     single_task: str | None = None,
     display_data: bool = False,
     display_compressed_images: bool = False,
+    is_reset_loop: bool = False,
 ):
+    # When ``is_reset_loop`` is True the loop ignores ``control_time_s`` and
+    # waits indefinitely for ``events['exit_early']`` to flip (toggled by the
+    # foot pedal, space-bar, or the right-arrow key).  This is useful when the
+    # operator needs an unbounded amount of time to reset the environment
+    # between episodes.
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
 
@@ -309,7 +315,12 @@ def record_loop(
     )
     if last_paused_state and dataset is not None:
         logging.info("Recording starts in PAUSED state — frames will not be appended until pedal/key resume.")
-    while timestamp < control_time_s:
+    if is_reset_loop:
+        logging.info(
+            "Reset window started — waiting for pedal/space/right-arrow press to "
+            "start the next episode (reset_time_s is ignored)."
+        )
+    while is_reset_loop or timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
         if events["exit_early"]:
@@ -520,11 +531,20 @@ def record(
         # takes effect on the next loop iteration.
         events["paused"] = False
 
+        # Track whether we're currently in the reset window so the pedal /
+        # space-bar can act as "start next episode" instead of pause/resume.
+        events["reset_active"] = False
+
         if cfg.pedal.enabled:
             toggle_code = cfg.pedal.toggle_pause
 
             def _on_pedal_press(code: str) -> None:
-                if code == toggle_code:
+                if code != toggle_code:
+                    return
+                if events.get("reset_active", False):
+                    events["exit_early"] = True
+                    logging.info("Pedal pressed during reset — starting next episode.")
+                else:
                     events["paused"] = not events.get("paused", False)
                     state = "PAUSED" if events["paused"] else "RESUMED"
                     logging.info("Pedal toggled recording: %s", state)
@@ -554,7 +574,12 @@ def record(
                 from pynput import keyboard as _kb
 
                 def _on_space(key):
-                    if key == _kb.Key.space:
+                    if key != _kb.Key.space:
+                        return
+                    if events.get("reset_active", False):
+                        events["exit_early"] = True
+                        logging.info("Space-bar pressed during reset — starting next episode.")
+                    else:
                         events["paused"] = not events.get("paused", False)
                         state = "PAUSED" if events["paused"] else "RESUMED"
                         logging.info("Space-bar toggled recording: %s", state)
@@ -596,18 +621,28 @@ def record(
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
 
-                    record_loop(
-                        robot=robot,
-                        events=events,
-                        fps=cfg.dataset.fps,
-                        teleop_action_processor=teleop_action_processor,
-                        robot_action_processor=robot_action_processor,
-                        robot_observation_processor=robot_observation_processor,
-                        teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
-                        single_task=cfg.dataset.single_task,
-                        display_data=cfg.display_data,
-                    )
+                    events["reset_active"] = True
+                    # Make sure exit_early is fresh entering the reset window so
+                    # a stale True doesn't immediately end it, and clear paused
+                    # so the next episode starts unpaused.
+                    events["exit_early"] = False
+                    events["paused"] = False
+                    try:
+                        record_loop(
+                            robot=robot,
+                            events=events,
+                            fps=cfg.dataset.fps,
+                            teleop_action_processor=teleop_action_processor,
+                            robot_action_processor=robot_action_processor,
+                            robot_observation_processor=robot_observation_processor,
+                            teleop=teleop,
+                            control_time_s=cfg.dataset.reset_time_s,
+                            single_task=cfg.dataset.single_task,
+                            display_data=cfg.display_data,
+                            is_reset_loop=cfg.dataset.reset_wait_for_pedal,
+                        )
+                    finally:
+                        events["reset_active"] = False
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)
