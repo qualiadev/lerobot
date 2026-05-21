@@ -92,6 +92,7 @@ from lerobot.cameras.depthai.configuration_depthai import DepthAICameraConfig  #
 import logging
 import time
 from dataclasses import asdict, dataclass
+from dataclasses import field as dataclass_field
 from pprint import pformat
 
 from lerobot.cameras import CameraConfig  # noqa: F401
@@ -157,12 +158,34 @@ from lerobot.teleoperators.keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.pedal import DEFAULT_PEDAL_DEVICE, start_pedal_listener
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import (
     init_logging,
     log_say,
 )
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+
+
+@dataclass
+class RecordPedalConfig:
+    """Foot pedal configuration for pausing/resuming dataset frame writes.
+
+    The pedal toggles whether new frames are appended to the dataset.  The robot
+    keeps executing teleop commands while paused (the control loop is unaffected),
+    only ``dataset.add_frame(...)`` is skipped.  Press the pedal again to resume.
+
+    Pedal codes are evdev key code strings (e.g. ``"KEY_A"``) as reported by the
+    underlying USB HID device.  PCsensor single-pedal devices report ``KEY_A``
+    by default.
+    """
+
+    # Enable pedal listener.  When false, no pedal thread is spawned.
+    enabled: bool = False
+    # Linux input device path.  Defaults to the PCsensor single-pedal device.
+    device_path: str = DEFAULT_PEDAL_DEVICE
+    # Evdev key code emitted by the pedal that toggles pause/resume.
+    toggle_pause: str = "KEY_A"
 
 
 @dataclass
@@ -183,6 +206,8 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
+    # Foot pedal pause/resume controls for dataset frame writes.
+    pedal: RecordPedalConfig = dataclass_field(default_factory=RecordPedalConfig)
 
     def __post_init__(self):
         if self.teleop is None:
@@ -273,12 +298,27 @@ def record_loop(
     no_action_count = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
+    # Track pause-state transitions so we only log once per edge instead of every tick.
+    last_paused_state = events.get("paused", False)
+    if last_paused_state and dataset is not None:
+        logging.info("Recording starts in PAUSED state — frames will not be appended until pedal/key resume.")
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
         if events["exit_early"]:
             events["exit_early"] = False
             break
+
+        # Edge-trigger logging on pause/resume.  The pause flag is mutated by the
+        # pedal listener thread (and the keyboard listener) — we do not clear it
+        # here so the state persists across loop iterations until toggled again.
+        paused = events.get("paused", False)
+        if paused != last_paused_state:
+            if paused:
+                logging.info("Recording PAUSED — robot still executing teleop, but frames are NOT being saved.")
+            else:
+                logging.info("Recording RESUMED — appending frames to dataset.")
+            last_paused_state = paused
 
         # Get robot observation
         obs = robot.get_observation()
@@ -325,8 +365,10 @@ def record_loop(
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
 
-        # Write to dataset
-        if dataset is not None:
+        # Write to dataset (skipped while paused: robot keeps moving, but no frames
+        # are appended; this produces a continuous in-distribution recording with
+        # the operator's chosen gap segments excluded).
+        if dataset is not None and not paused:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
@@ -397,6 +439,8 @@ def record(
 
     dataset = None
     listener = None
+    pedal_thread = None
+    space_listener = None
 
     try:
         if cfg.resume:
@@ -445,6 +489,56 @@ def record(
             teleop.connect()
 
         listener, events = init_keyboard_listener()
+        # Augment the events dict with a pause flag toggled by the foot pedal or
+        # the space-bar.  The dict is shared by reference with all listener
+        # threads and the recording loop, so flipping the flag from any thread
+        # takes effect on the next loop iteration.
+        events["paused"] = False
+
+        if cfg.pedal.enabled:
+            toggle_code = cfg.pedal.toggle_pause
+
+            def _on_pedal_press(code: str) -> None:
+                if code == toggle_code:
+                    events["paused"] = not events.get("paused", False)
+                    state = "PAUSED" if events["paused"] else "RESUMED"
+                    logging.info("Pedal toggled recording: %s", state)
+
+            pedal_thread = start_pedal_listener(
+                _on_pedal_press, device_path=cfg.pedal.device_path
+            )
+            if pedal_thread is None:
+                logging.warning(
+                    "Pedal listener could not start (evdev missing or device %s unavailable). "
+                    "Falling back to keyboard space-bar for pause toggle.",
+                    cfg.pedal.device_path,
+                )
+            else:
+                logging.info(
+                    "Foot pedal listener started — press %s on %s to toggle pause/resume.",
+                    toggle_code,
+                    cfg.pedal.device_path,
+                )
+
+        # Always also bind space-bar as a pause toggle when not headless: it is
+        # useful both as a fallback when the pedal is unavailable and as an
+        # alternative input.  ``init_keyboard_listener`` already owns the arrow
+        # / ESC keys, so we register a second pynput listener for space only.
+        if not is_headless():
+            try:
+                from pynput import keyboard as _kb
+
+                def _on_space(key):
+                    if key == _kb.Key.space:
+                        events["paused"] = not events.get("paused", False)
+                        state = "PAUSED" if events["paused"] else "RESUMED"
+                        logging.info("Space-bar toggled recording: %s", state)
+
+                space_listener = _kb.Listener(on_press=_on_space)
+                space_listener.start()
+                logging.info("Space-bar pause toggle armed.")
+            except Exception as _e:  # pragma: no cover - defensive
+                logging.debug("Space-bar pause listener unavailable: %s", _e)
 
         if not cfg.dataset.streaming_encoding:
             logging.info(
@@ -512,6 +606,13 @@ def record(
 
         if not is_headless() and listener:
             listener.stop()
+        if space_listener is not None:
+            try:
+                space_listener.stop()
+            except Exception:  # pragma: no cover - defensive
+                pass
+        # pedal_thread is a daemon evdev reader — it will exit on process teardown;
+        # we do not need to join() it here.
 
         if cfg.dataset.push_to_hub:
             if dataset and dataset.num_episodes > 0:
