@@ -166,6 +166,20 @@ from lerobot.utils.utils import (
 )
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
+# State used by the slow-loop warning rate-limiter in ``record_loop``.  Kept at
+# module scope so a re-entry into ``record_loop`` (e.g. episode -> reset ->
+# next episode) preserves the "are we currently in the slow regime?" bit and
+# avoids spamming a fresh WARN on every loop entry.
+_slow_warn_state = {
+    "slow": False,           # True while we believe the loop is slow
+    "slow_since_s": 0.0,     # perf_counter time when we entered the slow regime
+    "last_emit_s": 0.0,      # perf_counter time of the last WARN emit
+}
+# Minimum seconds between repeated "loop is slow" WARNs once we're in the slow
+# regime.  One WARN every ~5s is enough to surface a real problem without
+# burying the rest of the logs.
+_SLOW_WARN_REMIND_S = 5.0
+
 
 @dataclass
 class RecordPedalConfig:
@@ -265,12 +279,19 @@ def record_loop(
     display_data: bool = False,
     display_compressed_images: bool = False,
     is_reset_loop: bool = False,
+    slow_loop_warn_below_hz: float = 0.0,
 ):
     # When ``is_reset_loop`` is True the loop ignores ``control_time_s`` and
     # waits indefinitely for ``events['exit_early']`` to flip (toggled by the
     # foot pedal, space-bar, or the right-arrow key).  This is useful when the
     # operator needs an unbounded amount of time to reset the environment
     # between episodes.
+    #
+    # ``slow_loop_warn_below_hz`` filters the "Record loop is running slower"
+    # warning so it only fires when the measured rate drops below the given
+    # threshold.  0 (the default) keeps the old per-tick behaviour.  The
+    # warning is also edge-triggered with periodic reminders to avoid flooding
+    # logs at the loop rate.
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
 
@@ -412,9 +433,41 @@ def record_loop(
 
         sleep_time_s: float = control_interval - dt_s
         if sleep_time_s < 0:
-            logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
+            measured_hz = 1 / dt_s if dt_s > 0 else float("inf")
+            # Only emit when below the user-specified threshold (0 = always),
+            # and rate-limit log lines.  We use closure-local state attached
+            # to the function so we don't pollute the outer scope.
+            should_emit = (
+                slow_loop_warn_below_hz <= 0.0
+                or measured_hz < slow_loop_warn_below_hz
             )
+            if should_emit:
+                state = _slow_warn_state
+                now_warn = time.perf_counter()
+                if not state["slow"] or (now_warn - state["last_emit_s"]) >= _SLOW_WARN_REMIND_S:
+                    if not state["slow"]:
+                        state["slow"] = True
+                        state["slow_since_s"] = now_warn
+                    logging.warning(
+                        "Record loop is running slower (%.1f Hz) than the target FPS (%d Hz). "
+                        "Dataset frames might be dropped and robot control might be unstable. "
+                        "Common causes are: 1) Camera FPS not keeping up 2) Policy inference "
+                        "taking too long 3) CPU starvation",
+                        measured_hz,
+                        fps,
+                    )
+                    state["last_emit_s"] = now_warn
+        else:
+            # Loop met the target this tick.  If we were previously in the
+            # slow regime, log a single recovery line and reset the state.
+            state = _slow_warn_state
+            if state["slow"]:
+                slow_for = time.perf_counter() - state["slow_since_s"]
+                logging.info(
+                    "Record loop recovered to target FPS (was slow for %.1fs).",
+                    slow_for,
+                )
+                state["slow"] = False
 
         precise_sleep(max(sleep_time_s, 0.0))
 
@@ -612,6 +665,7 @@ def record(
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
+                    slow_loop_warn_below_hz=cfg.dataset.slow_loop_warn_below_hz,
                 )
 
                 # Execute a few seconds without recording to give time to manually reset the environment
@@ -640,6 +694,7 @@ def record(
                             single_task=cfg.dataset.single_task,
                             display_data=cfg.display_data,
                             is_reset_loop=cfg.dataset.reset_wait_for_pedal,
+                            slow_loop_warn_below_hz=cfg.dataset.slow_loop_warn_below_hz,
                         )
                     finally:
                         events["reset_active"] = False

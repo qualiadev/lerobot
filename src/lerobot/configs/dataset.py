@@ -40,6 +40,13 @@ class DatasetRecordConfig:
     # arrow) before starting the next episode.  Use this when reset duration is
     # highly variable and you want the operator to stay in control.
     reset_wait_for_pedal: bool = False
+    # Threshold in Hz below which the 'record loop is slow' warning is emitted.
+    # 0 (default) preserves the historical behaviour of warning on every slow
+    # tick.  Set e.g. 10.0 to suppress the warning unless the measured loop
+    # rate drops under 10 Hz — useful when minor jitter spam drowns out real
+    # problems.  Edge-triggered: one WARN on entering the slow regime, one
+    # INFO on leaving it, with periodic reminders while still slow.
+    slow_loop_warn_below_hz: float = 0.0
     # Number of episodes to record.
     num_episodes: int = 50
     # Encode frames in the dataset into video
