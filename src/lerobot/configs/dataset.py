@@ -33,6 +33,11 @@ class DatasetRecordConfig:
     fps: int = 30
     # Number of seconds for data recording for each episode.
     episode_time_s: int | float = 60
+    # When True, the episode runs indefinitely (episode_time_s is ignored) and
+    # only ends when the operator presses the foot-pedal's end-episode key
+    # (default KEY_B), or discards the episode via the discard key (default
+    # KEY_A).  Use when episode duration is highly variable and operator-driven.
+    episode_wait_for_pedal: bool = False
     # Number of seconds for resetting the environment after each episode.
     reset_time_s: int | float = 60
     # When True, the reset window between episodes ignores reset_time_s and

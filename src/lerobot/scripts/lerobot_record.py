@@ -183,23 +183,39 @@ _SLOW_WARN_REMIND_S = 5.0
 
 @dataclass
 class RecordPedalConfig:
-    """Foot pedal configuration for pausing/resuming dataset frame writes.
+    """Foot pedal configuration for recording controls.
 
-    The pedal toggles whether new frames are appended to the dataset.  The robot
-    keeps executing teleop commands while paused (the control loop is unaffected),
-    only ``dataset.add_frame(...)`` is skipped.  Press the pedal again to resume.
+    Default mapping for the PCsensor 3-key foot pedal:
+      * ``toggle_pause`` (KEY_C):  pause/resume recording during an episode,
+        and "done resetting, start next episode" during the reset window.
+        Robot keeps executing teleop while paused; only ``add_frame`` is
+        skipped, so resume produces a continuous in-distribution recording
+        with the operator's chosen gap segments excluded.
+      * ``end_episode`` (KEY_B):   end the current episode now and save it
+        normally.  Pairs with ``--dataset.episode_wait_for_pedal=true`` for
+        an indefinite-length episode where pedal-B is the only way out.
+      * ``discard_episode`` (KEY_A): discard the current episode (clear its
+        frame buffer) and immediately enter the reset window so the operator
+        can re-record.  Equivalent to the existing Escape-key behaviour but
+        on the foot pedal.
 
-    Pedal codes are evdev key code strings (e.g. ``"KEY_A"``) as reported by the
-    underlying USB HID device.  PCsensor single-pedal devices report ``KEY_A``
-    by default.
+    Pedal codes are evdev key code strings (e.g. ``"KEY_A"``) as reported by
+    the underlying USB HID device.
     """
 
     # Enable pedal listener.  When false, no pedal thread is spawned.
     enabled: bool = False
     # Linux input device path.  Defaults to the PCsensor single-pedal device.
     device_path: str = DEFAULT_PEDAL_DEVICE
-    # Evdev key code emitted by the pedal that toggles pause/resume.
-    toggle_pause: str = "KEY_A"
+    # Evdev key code emitted by the pedal that toggles pause/resume during an
+    # episode, or "start next episode" during the reset window.
+    toggle_pause: str = "KEY_C"
+    # Evdev key code that ends the current episode and saves it normally.
+    end_episode: str = "KEY_B"
+    # Evdev key code that discards the current episode and re-runs it after the
+    # reset window.  Wires into the existing ``events['rerecord_episode']``
+    # signal used elsewhere in lerobot (the Escape key default).
+    discard_episode: str = "KEY_A"
 
 
 @dataclass
@@ -279,6 +295,7 @@ def record_loop(
     display_data: bool = False,
     display_compressed_images: bool = False,
     is_reset_loop: bool = False,
+    wait_for_pedal_to_end: bool = False,
     slow_loop_warn_below_hz: float = 0.0,
 ):
     # When ``is_reset_loop`` is True the loop ignores ``control_time_s`` and
@@ -286,6 +303,11 @@ def record_loop(
     # foot pedal, space-bar, or the right-arrow key).  This is useful when the
     # operator needs an unbounded amount of time to reset the environment
     # between episodes.
+    #
+    # When ``wait_for_pedal_to_end`` is True (during an actual recording
+    # episode), the loop also ignores ``control_time_s`` and runs until the
+    # operator triggers ``exit_early`` (pedal-B / pedal-A / Escape / Enter)
+    # — i.e. "infinite" episode duration.
     #
     # ``slow_loop_warn_below_hz`` filters the "Record loop is running slower"
     # warning so it only fires when the measured rate drops below the given
@@ -341,7 +363,12 @@ def record_loop(
             "Reset window started — waiting for pedal/space/right-arrow press to "
             "start the next episode (reset_time_s is ignored)."
         )
-    while is_reset_loop or timestamp < control_time_s:
+    elif wait_for_pedal_to_end:
+        logging.info(
+            "Episode started in indefinite mode — will record until pedal-end "
+            "is pressed (episode_time_s is ignored)."
+        )
+    while is_reset_loop or wait_for_pedal_to_end or timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
         if events["exit_early"]:
@@ -590,17 +617,64 @@ def record(
 
         if cfg.pedal.enabled:
             toggle_code = cfg.pedal.toggle_pause
+            end_code = cfg.pedal.end_episode
+            discard_code = cfg.pedal.discard_episode
 
             def _on_pedal_press(code: str) -> None:
-                if code != toggle_code:
+                # toggle_pause (default KEY_C): pause/resume during episode,
+                # "start next episode" during the reset window.
+                if code == toggle_code:
+                    if events.get("reset_active", False):
+                        events["exit_early"] = True
+                        logging.info("Pedal (%s) pressed during reset — starting next episode.", code)
+                    else:
+                        events["paused"] = not events.get("paused", False)
+                        state = "PAUSED" if events["paused"] else "RESUMED"
+                        logging.info("Pedal (%s) toggled recording: %s", code, state)
                     return
-                if events.get("reset_active", False):
-                    events["exit_early"] = True
-                    logging.info("Pedal pressed during reset — starting next episode.")
-                else:
-                    events["paused"] = not events.get("paused", False)
-                    state = "PAUSED" if events["paused"] else "RESUMED"
-                    logging.info("Pedal toggled recording: %s", state)
+                # end_episode (default KEY_B): end current episode and save
+                # normally.  No-op during the reset window.
+                if code == end_code:
+                    if events.get("reset_active", False):
+                        logging.info(
+                            "Pedal (%s) end-episode pressed during reset — ignored "
+                            "(press %s to start the next episode).",
+                            code,
+                            toggle_code,
+                        )
+                    else:
+                        events["exit_early"] = True
+                        # Clear paused so the reset window starts cleanly
+                        # (otherwise a leftover PAUSED state would carry over).
+                        events["paused"] = False
+                        logging.info(
+                            "Pedal (%s) end-episode pressed — saving episode and "
+                            "entering reset.",
+                            code,
+                        )
+                    return
+                # discard_episode (default KEY_A): drop current episode, enter
+                # reset window, re-record.  No-op during reset (you already are
+                # between episodes; the previous discard already cleared it).
+                if code == discard_code:
+                    if events.get("reset_active", False):
+                        logging.info(
+                            "Pedal (%s) discard pressed during reset — ignored "
+                            "(already between episodes).",
+                            code,
+                        )
+                    else:
+                        events["rerecord_episode"] = True
+                        events["exit_early"] = True
+                        events["paused"] = False
+                        logging.info(
+                            "Pedal (%s) discard pressed — dropping episode, "
+                            "entering reset.",
+                            code,
+                        )
+                    return
+                # Unknown code: log at DEBUG to aid pedal-mapping discovery.
+                logging.debug("Pedal key-down ignored (no mapping): %s", code)
 
             pedal_thread = start_pedal_listener(
                 _on_pedal_press, device_path=cfg.pedal.device_path
@@ -613,9 +687,14 @@ def record(
                 )
             else:
                 logging.info(
-                    "Foot pedal listener started — press %s on %s to toggle pause/resume.",
-                    toggle_code,
+                    "Foot pedal listener started on %s. Active mapping: "
+                    "%s = pause/resume (or 'start next episode' during reset); "
+                    "%s = end current episode and save; "
+                    "%s = discard current episode and re-record.",
                     cfg.pedal.device_path,
+                    toggle_code,
+                    end_code,
+                    discard_code,
                 )
 
         # Always also bind space-bar as a pause toggle when not headless: it is
@@ -652,6 +731,11 @@ def record(
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                # Clear pedal-driven flags entering the episode so a stale True
+                # from the previous reset window can't immediately end it.
+                events["exit_early"] = False
+                events["rerecord_episode"] = False
+                events["paused"] = False
                 record_loop(
                     robot=robot,
                     events=events,
@@ -665,6 +749,7 @@ def record(
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
+                    wait_for_pedal_to_end=cfg.dataset.episode_wait_for_pedal,
                     slow_loop_warn_below_hz=cfg.dataset.slow_loop_warn_below_hz,
                 )
 
